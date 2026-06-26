@@ -3,7 +3,7 @@ using Shared.Caching;
 
 namespace InventoryService.Infrastructure.Consumers;
 
-public record StockChangedEvent(Guid SkuId, int NewQuantityOnHand, string EventId);
+public record StockChangedEvent(Guid SkuId, Guid WarehouseId, int NewQuantityOnHand, string EventId);
 
 /// <summary>
 /// Consumes domain events relayed from the Outbox (e.g. StockChangedEvent)
@@ -19,14 +19,19 @@ public record StockChangedEvent(Guid SkuId, int NewQuantityOnHand, string EventI
 public sealed class StockChangedConsumer
 {
     private readonly ICacheService _cache;
+    private readonly CachedQueryService _cachedQuery;
     private readonly ILogger<StockChangedConsumer> _logger;
 
     private const string ConsumerGroup = "inventory-cache-invalidator";
     private static readonly TimeSpan DedupWindow = TimeSpan.FromHours(24);
 
-    public StockChangedConsumer(ICacheService cache, ILogger<StockChangedConsumer> logger)
+    public StockChangedConsumer(
+        ICacheService cache,
+        CachedQueryService cachedQuery,
+        ILogger<StockChangedConsumer> logger)
     {
         _cache = cache;
+        _cachedQuery = cachedQuery;
         _logger = logger;
     }
 
@@ -42,11 +47,19 @@ public sealed class StockChangedConsumer
             return;
         }
 
+        // 1. Single-entity cache: direct key removal (cheap, precise).
         var cacheKey = CacheKeys.InventoryStock(@event.SkuId);
         await _cache.RemoveAsync(cacheKey, ct);
 
+        // 2. List/aggregate caches scoped to this warehouse: bump the
+        //    version counter instead of trying to enumerate every cached
+        //    threshold/filter combination that might be affected.
+        var scopeVersionKey = CacheKeys.WarehouseVersion(@event.WarehouseId);
+        var newVersion = await _cachedQuery.InvalidateScopeAsync(scopeVersionKey, ct);
+
         _logger.LogInformation(
-            "Invalidated stock cache for SKU {SkuId} after {EventId}", @event.SkuId, @event.EventId);
+            "Invalidated stock cache for SKU {SkuId} and bumped warehouse {WarehouseId} to v{Version} after {EventId}",
+            @event.SkuId, @event.WarehouseId, newVersion, @event.EventId);
 
         // Note: we invalidate rather than write-through here. The next read
         // will repopulate via cache-aside with the stampede-safe lock.

@@ -6,10 +6,31 @@ Drop-in Redis caching module implementing the best practices discussed:
 |---|---|
 | `ICacheService.cs` | Abstraction — keeps the rest of the app decoupled from StackExchange.Redis |
 | `CacheKeys.cs` | Centralized, versioned key naming |
-| `RedisCacheService.cs` | Implementation: cache-aside, stampede-lock protection, Polly retry + circuit breaker, idempotency guard |
+| `RedisCacheService.cs` | Implementation: cache-aside, stampede-lock protection, Polly retry + circuit breaker, idempotency guard, version counters |
+| `CachedQueryService.cs` | Version-counter helper for list/aggregate query caching (DB-style caching) |
 | `CachingServiceCollectionExtensions.cs` | DI registration |
-| `Example_GetStockLevelHandler.cs` | Cache-aside read example (InventoryService) |
-| `Example_StockChangedConsumer.cs` | Outbox/Kafka-driven invalidation + consumer dedup example |
+| `Example_GetStockLevelHandler.cs` | Cache-aside read example — single entity, direct-key invalidation (InventoryService) |
+| `Example_GetLowStockSkusHandler.cs` | List-query example — version-counter invalidation (InventoryService) |
+| `Example_StockChangedConsumer.cs` | Outbox/Kafka-driven invalidation for both patterns + consumer dedup |
+
+## Two invalidation strategies, by query shape
+
+**Single entity (`GetStockLevelHandler`)** — direct key removal. One event,
+one key (`inventory:sku:{id}`). Cheap and precise.
+
+**List/aggregate (`GetLowStockSkusHandler`)** — version-counter pattern.
+Any stock change in a warehouse could affect a low-stock list, a paginated
+catalog page, a dashboard aggregate — too many query-shape permutations to
+enumerate and delete individually. Instead:
+
+1. Every query key embeds a version: `inventory:warehouse:{id}:low-stock:{threshold}:v{n}`
+2. A write bumps `warehouse:{id}:version` via atomic `INCR`
+3. Every cache entry built against the old version is now unreachable —
+   nothing ever reads that key again — and it simply expires via its own
+   short TTL. No fan-out SCAN, no tracked key-set bookkeeping.
+
+This is why `CachedQueryService` TTLs should stay short (15–30s): orphaned
+entries sit in Redis memory until eviction.
 
 ## Wiring it up (`Program.cs`)
 

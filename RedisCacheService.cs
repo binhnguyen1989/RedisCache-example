@@ -195,6 +195,46 @@ public sealed class RedisCacheService : ICacheService
         }
     }
 
+    public async Task<long> GetVersionAsync(string versionKey, CancellationToken ct = default)
+    {
+        try
+        {
+            var value = await _resiliencePipeline.ExecuteAsync(
+                async token => await Db.StringGetAsync(versionKey), ct);
+
+            if (value.IsNullOrEmpty)
+                return 1; // un-versioned baseline; matches BumpVersionAsync's first INCR result
+
+            return (long)value;
+        }
+        catch (BrokenCircuitException)
+        {
+            _logger.LogWarning("Redis circuit open; defaulting version for {Key} to 1", versionKey);
+            return 1;
+        }
+    }
+
+    public async Task<long> BumpVersionAsync(string versionKey, CancellationToken ct = default)
+    {
+        try
+        {
+            // INCR is atomic and creates the key at 1 if it doesn't exist,
+            // so the very first bump takes you from "no version" to v1.
+            return await _resiliencePipeline.ExecuteAsync(
+                async token => await Db.StringIncrementAsync(versionKey), ct);
+        }
+        catch (BrokenCircuitException)
+        {
+            _logger.LogError(
+                "Redis circuit open; could not bump version for {Key}. " +
+                "Stale list-query caches may persist until their TTL expires.", versionKey);
+
+            // Returning a value here would be misleading — callers shouldn't
+            // build cache keys from a version bump that didn't actually land.
+            throw;
+        }
+    }
+
     private async Task<bool> TryAcquireLockAsync(string lockKey, string token, CancellationToken ct)
     {
         try

@@ -16,6 +16,19 @@ public static class CacheKeys
     public static string WarehouseConfig(Guid warehouseId, int version = 1)
         => $"warehouse:{warehouseId}:config:v{version}";
 
+    /// <summary>
+    /// Version counter for a warehouse scope. Bump this whenever stock
+    /// changes within the warehouse; every list/aggregate query cached
+    /// against the old version is orphaned and expires via TTL.
+    /// Used with <see cref="CachedQueryService"/>.
+    /// </summary>
+    public static string WarehouseVersion(Guid warehouseId)
+        => $"warehouse:{warehouseId}:version";
+
+    /// <summary>Unversioned query-shape key — CachedQueryService appends ":v{n}".</summary>
+    public static string LowStockSkusShape(Guid warehouseId, int threshold)
+        => $"inventory:warehouse:{warehouseId}:low-stock:{threshold}";
+
     /// <summary>Key for idempotent Kafka consumer dedup.</summary>
     public static string ConsumerDedup(string consumerGroup, string messageKey)
         => $"idem:{consumerGroup}:{messageKey}";

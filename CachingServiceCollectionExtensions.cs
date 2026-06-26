@@ -29,6 +29,7 @@ public static class CachingServiceCollectionExtensions
         });
 
         services.AddSingleton<ICacheService, RedisCacheService>();
+        services.AddSingleton<CachedQueryService>();
 
         return services;
     }
