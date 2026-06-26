@@ -86,7 +86,29 @@ dotnet add package Polly.Core
 5. **TTLs are always set** — even the "safety net" 24h ones — there is no
    permanent-cache path in this module by design.
 
-## Next steps you might want
+## Failure handling contract
+
+**No method on `RedisCacheService` throws a Redis-origin exception.** Every
+public operation routes through a single `SafeExecuteAsync` wrapper that
+catches `RedisException` (covers connection drops, timeouts, *and*
+server-side errors like Redis's own "Internal server error"), plain
+`TimeoutException`, and `BrokenCircuitException` — then degrades to a safe
+fallback (cache miss, "lock not acquired", version `-1`, etc.) instead of
+propagating.
+
+This matters because Polly's retry/circuit-breaker only kicks in for
+exception types you've told it to handle, and only the circuit-breaker
+state is unmissable from `catch` blocks — anything before the breaker trips
+(a one-off server error, a timeout that hasn't yet crossed the failure
+ratio) was previously **uncaught** and would surface as a 500 to your API
+callers. `SafeExecuteAsync` closes that gap by catching the whole
+`RedisException` hierarchy at every call site, not just `BrokenCircuitException`.
+
+`BumpVersionAsync` is the one place a caller needs to check a sentinel: it
+returns `-1` (not an exception) if Redis was unavailable, so callers like
+`StockChangedConsumer` can log appropriately without crashing.
+
+
 
 - A `RemoveByPrefixAsync` call after warehouse config changes (bumps cover
   multiple SKUs under one warehouse)

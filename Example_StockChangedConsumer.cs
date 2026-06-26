@@ -57,9 +57,22 @@ public sealed class StockChangedConsumer
         var scopeVersionKey = CacheKeys.WarehouseVersion(@event.WarehouseId);
         var newVersion = await _cachedQuery.InvalidateScopeAsync(scopeVersionKey, ct);
 
-        _logger.LogInformation(
-            "Invalidated stock cache for SKU {SkuId} and bumped warehouse {WarehouseId} to v{Version} after {EventId}",
-            @event.SkuId, @event.WarehouseId, newVersion, @event.EventId);
+        if (newVersion < 0)
+        {
+            // Redis was unavailable for the bump (see RedisCacheService's
+            // fail-safe contract). List-query caches for this warehouse may
+            // serve stale data until their TTL expires — acceptable given
+            // those TTLs are already short (~30s), but worth a loud log.
+            _logger.LogError(
+                "Could not bump version for warehouse {WarehouseId} after {EventId}; " +
+                "low-stock/list caches may be briefly stale", @event.WarehouseId, @event.EventId);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Invalidated stock cache for SKU {SkuId} and bumped warehouse {WarehouseId} to v{Version} after {EventId}",
+                @event.SkuId, @event.WarehouseId, newVersion, @event.EventId);
+        }
 
         // Note: we invalidate rather than write-through here. The next read
         // will repopulate via cache-aside with the stampede-safe lock.

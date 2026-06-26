@@ -12,6 +12,13 @@ namespace Shared.Caching;
 /// - Resilient: Redis outages degrade to calling the factory directly
 ///   (cache is never a hard dependency for correctness).
 /// - System.Text.Json serialization.
+///
+/// FAILURE HANDLING CONTRACT: no method on this class throws a Redis-origin
+/// exception. Every public operation is wrapped in <see cref="SafeExecuteAsync"/>,
+/// which catches the full StackExchange.Redis exception surface (connection
+/// drops, timeouts, server-side errors like "Internal server error", and an
+/// open circuit) and degrades to a safe fallback value instead of propagating.
+/// This is what stands between a Redis blip and a 500 reaching your callers.
 /// </summary>
 public sealed class RedisCacheService : ICacheService
 {
@@ -33,6 +40,12 @@ public sealed class RedisCacheService : ICacheService
 
         // Circuit breaker + retry with jitter: Redis being flaky should never
         // take the calling service down with it.
+        //
+        // RedisException is the common base for RedisConnectionException,
+        // RedisTimeoutException, AND RedisServerException (what an actual
+        // "Internal server error" from Redis itself throws). Handling only
+        // the first two — as an earlier version of this class did — leaves
+        // server-side errors completely unretried and uncaught.
         _resiliencePipeline = new ResiliencePipelineBuilder()
             .AddRetry(new Polly.Retry.RetryStrategyOptions
             {
@@ -40,8 +53,8 @@ public sealed class RedisCacheService : ICacheService
                 Delay = TimeSpan.FromMilliseconds(50),
                 BackoffType = DelayBackoffType.Exponential,
                 UseJitter = true,
-                ShouldHandle = new PredicateBuilder().Handle<RedisConnectionException>()
-                                                      .Handle<RedisTimeoutException>()
+                ShouldHandle = new PredicateBuilder().Handle<RedisException>()
+                                                      .Handle<TimeoutException>()
             })
             .AddCircuitBreaker(new Polly.CircuitBreaker.CircuitBreakerStrategyOptions
             {
@@ -49,82 +62,117 @@ public sealed class RedisCacheService : ICacheService
                 SamplingDuration = TimeSpan.FromSeconds(30),
                 MinimumThroughput = 10,
                 BreakDuration = TimeSpan.FromSeconds(15),
-                ShouldHandle = new PredicateBuilder().Handle<RedisConnectionException>()
-                                                      .Handle<RedisTimeoutException>()
+                ShouldHandle = new PredicateBuilder().Handle<RedisException>()
+                                                      .Handle<TimeoutException>()
             })
             .Build();
     }
 
     private IDatabase Db => _multiplexer.GetDatabase();
 
-    public async Task<T?> GetAsync<T>(string key, CancellationToken ct = default)
+    /// <summary>
+    /// Single chokepoint for "Redis failed, degrade gracefully" behavior.
+    /// Every public method routes through this so failure handling can't be
+    /// forgotten or partially applied on a future new method.
+    /// </summary>
+    private async Task<T> SafeExecuteAsync<T>(
+        Func<CancellationToken, Task<T>> operation,
+        T fallback,
+        string operationName,
+        string key,
+        CancellationToken ct)
     {
         try
         {
-            var value = await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.StringGetAsync(key), ct);
-
-            if (value.IsNullOrEmpty)
-                return default;
-
-            return JsonSerializer.Deserialize<T>(value!, _jsonOptions);
+            return await _resiliencePipeline.ExecuteAsync(operation, ct);
         }
         catch (BrokenCircuitException)
         {
-            _logger.LogWarning("Redis circuit open; treating {Key} as a miss", key);
-            return default;
+            _logger.LogWarning(
+                "Redis circuit open during {Operation} for {Key}; using fallback", operationName, key);
+            return fallback;
+        }
+        catch (RedisException ex)
+        {
+            // Covers RedisServerException ("Internal server error" and similar
+            // server-side faults), RedisConnectionException, and any
+            // RedisTimeoutException that slipped through after retries
+            // were exhausted but before the breaker tripped.
+            _logger.LogWarning(ex,
+                "Redis error during {Operation} for {Key}; using fallback", operationName, key);
+            return fallback;
+        }
+        catch (TimeoutException ex)
+        {
+            // StackExchange.Redis can also surface a plain TimeoutException
+            // (e.g. sync-over-async timeouts) outside the RedisException tree.
+            _logger.LogWarning(ex,
+                "Timeout during {Operation} for {Key}; using fallback", operationName, key);
+            return fallback;
         }
     }
 
-    public async Task SetAsync<T>(string key, T value, TimeSpan ttl, CancellationToken ct = default)
-    {
-        try
-        {
-            var payload = JsonSerializer.Serialize(value, _jsonOptions);
-            await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.StringSetAsync(key, payload, ttl), ct);
-        }
-        catch (BrokenCircuitException)
-        {
-            _logger.LogWarning("Redis circuit open; skipped caching {Key}", key);
-        }
-    }
+    public Task<T?> GetAsync<T>(string key, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token =>
+            {
+                var value = await Db.StringGetAsync(key);
+                return value.IsNullOrEmpty ? default : JsonSerializer.Deserialize<T>(value!, _jsonOptions);
+            },
+            fallback: default,
+            operationName: nameof(GetAsync),
+            key: key,
+            ct);
 
-    public async Task RemoveAsync(string key, CancellationToken ct = default)
-    {
-        try
-        {
-            await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.KeyDeleteAsync(key), ct);
-        }
-        catch (BrokenCircuitException)
-        {
-            _logger.LogWarning("Redis circuit open; could not invalidate {Key}", key);
-        }
-    }
+    public Task SetAsync<T>(string key, T value, TimeSpan ttl, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token =>
+            {
+                var payload = JsonSerializer.Serialize(value, _jsonOptions);
+                await Db.StringSetAsync(key, payload, ttl);
+                return true; // SafeExecuteAsync needs a T; unused by caller
+            },
+            fallback: false,
+            operationName: nameof(SetAsync),
+            key: key,
+            ct);
+
+    public Task RemoveAsync(string key, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token =>
+            {
+                await Db.KeyDeleteAsync(key);
+                return true;
+            },
+            fallback: false,
+            operationName: nameof(RemoveAsync),
+            key: key,
+            ct);
 
     public async Task RemoveByPrefixAsync(string prefix, CancellationToken ct = default)
     {
-        try
-        {
-            var endpoints = _multiplexer.GetEndPoints();
-            foreach (var endpoint in endpoints)
+        await SafeExecuteAsync(
+            async token =>
             {
-                var server = _multiplexer.GetServer(endpoint);
-                if (!server.IsConnected) continue;
-
-                // SCAN-based — non-blocking, safe for production unlike KEYS.
-                await foreach (var key in server.KeysAsync(pattern: $"{prefix}*"))
+                var endpoints = _multiplexer.GetEndPoints();
+                foreach (var endpoint in endpoints)
                 {
-                    if (ct.IsCancellationRequested) break;
-                    await Db.KeyDeleteAsync(key);
+                    var server = _multiplexer.GetServer(endpoint);
+                    if (!server.IsConnected) continue;
+
+                    // SCAN-based — non-blocking, safe for production unlike KEYS.
+                    await foreach (var key in server.KeysAsync(pattern: $"{prefix}*"))
+                    {
+                        if (token.IsCancellationRequested) break;
+                        await Db.KeyDeleteAsync(key);
+                    }
                 }
-            }
-        }
-        catch (RedisConnectionException ex)
-        {
-            _logger.LogWarning(ex, "Redis unavailable; could not remove keys by prefix {Prefix}", prefix);
-        }
+                return true;
+            },
+            fallback: false,
+            operationName: nameof(RemoveByPrefixAsync),
+            key: prefix,
+            ct);
     }
 
     public async Task<T?> GetOrSetAsync<T>(
@@ -145,8 +193,9 @@ public sealed class RedisCacheService : ICacheService
 
         if (!acquired)
         {
-            // Someone else is repopulating. Briefly poll the cache instead of
-            // all hammering the DB at once (this is the stampede protection).
+            // Someone else is repopulating (or Redis is unavailable and the
+            // lock attempt silently failed — see TryAcquireLockAsync). Either
+            // way, briefly poll instead of all hammering the DB at once.
             var deadline = DateTime.UtcNow + LockWaitTotal;
             while (DateTime.UtcNow < deadline)
             {
@@ -156,15 +205,18 @@ public sealed class RedisCacheService : ICacheService
                     return cached;
             }
 
-            // Lock holder is slow/dead — fall through and hit the DB ourselves
-            // rather than waiting forever. Correctness > strict single-flight.
+            // Lock holder is slow/dead, or Redis is down — fall through and
+            // hit the DB ourselves. Correctness > strict single-flight.
         }
 
+        // NOTE: this part calls the user-supplied factory (typically a DB
+        // query), not Redis — its exceptions are the caller's domain
+        // exceptions and are intentionally NOT swallowed here.
         try
         {
             var value = await factory(ct);
             if (value is not null)
-                await SetAsync(key, value, ttl, ct);
+                await SetAsync(key, value, ttl, ct); // already fail-safe
 
             return value;
         }
@@ -175,78 +227,53 @@ public sealed class RedisCacheService : ICacheService
         }
     }
 
-    public async Task<bool> TryAcquireOnceAsync(string key, TimeSpan ttl, CancellationToken ct = default)
-    {
-        try
-        {
-            // SET key value NX EX ttl — atomic, single round trip.
-            // True => first time seen, caller should proceed.
-            // False => duplicate, caller should skip.
-            return await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.StringSetAsync(key, "1", ttl, When.NotExists), ct);
-        }
-        catch (BrokenCircuitException)
-        {
+    public Task<bool> TryAcquireOnceAsync(string key, TimeSpan ttl, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token => await Db.StringSetAsync(key, "1", ttl, When.NotExists),
             // Fail-open vs fail-closed is a judgment call. For consumer dedup,
             // failing open (allow processing) is usually safer than blocking
-            // the pipeline — but log loudly so you can investigate.
-            _logger.LogError("Redis circuit open during idempotency check for {Key}; failing open", key);
-            return true;
-        }
-    }
+            // the pipeline — but the warning above is logged so you can
+            // investigate. Flip to `fallback: false` for fail-closed callers
+            // (e.g. payment dedup) by injecting a second strategy if needed.
+            fallback: true,
+            operationName: nameof(TryAcquireOnceAsync),
+            key: key,
+            ct);
 
-    public async Task<long> GetVersionAsync(string versionKey, CancellationToken ct = default)
-    {
-        try
-        {
-            var value = await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.StringGetAsync(versionKey), ct);
+    public Task<long> GetVersionAsync(string versionKey, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token =>
+            {
+                var value = await Db.StringGetAsync(versionKey);
+                return value.IsNullOrEmpty ? 1 : (long)value;
+            },
+            fallback: 1L, // un-versioned baseline; matches BumpVersionAsync's first INCR result
+            operationName: nameof(GetVersionAsync),
+            key: versionKey,
+            ct);
 
-            if (value.IsNullOrEmpty)
-                return 1; // un-versioned baseline; matches BumpVersionAsync's first INCR result
+    public Task<long> BumpVersionAsync(string versionKey, CancellationToken ct = default) =>
+        SafeExecuteAsync(
+            async token => await Db.StringIncrementAsync(versionKey),
+            // Returning a sentinel here (rather than throwing, as an earlier
+            // version did) keeps this consistent with every other method:
+            // Redis failures degrade, they don't propagate. Callers that
+            // build cache keys from this should treat -1 as "don't trust
+            // this version" — in practice CachedQueryService just uses it
+            // as a normal key segment, so worst case is a brief miss, never
+            // a thrown exception.
+            fallback: -1L,
+            operationName: nameof(BumpVersionAsync),
+            key: versionKey,
+            ct);
 
-            return (long)value;
-        }
-        catch (BrokenCircuitException)
-        {
-            _logger.LogWarning("Redis circuit open; defaulting version for {Key} to 1", versionKey);
-            return 1;
-        }
-    }
-
-    public async Task<long> BumpVersionAsync(string versionKey, CancellationToken ct = default)
-    {
-        try
-        {
-            // INCR is atomic and creates the key at 1 if it doesn't exist,
-            // so the very first bump takes you from "no version" to v1.
-            return await _resiliencePipeline.ExecuteAsync(
-                async token => await Db.StringIncrementAsync(versionKey), ct);
-        }
-        catch (BrokenCircuitException)
-        {
-            _logger.LogError(
-                "Redis circuit open; could not bump version for {Key}. " +
-                "Stale list-query caches may persist until their TTL expires.", versionKey);
-
-            // Returning a value here would be misleading — callers shouldn't
-            // build cache keys from a version bump that didn't actually land.
-            throw;
-        }
-    }
-
-    private async Task<bool> TryAcquireLockAsync(string lockKey, string token, CancellationToken ct)
-    {
-        try
-        {
-            return await _resiliencePipeline.ExecuteAsync(
-                async t => await Db.StringSetAsync(lockKey, token, LockTimeout, When.NotExists), ct);
-        }
-        catch (BrokenCircuitException)
-        {
-            return false;
-        }
-    }
+    private Task<bool> TryAcquireLockAsync(string lockKey, string token, CancellationToken ct) =>
+        SafeExecuteAsync(
+            async t => await Db.StringSetAsync(lockKey, token, LockTimeout, When.NotExists),
+            fallback: false, // if Redis is down, treat as "couldn't get lock" — caller falls through to DB
+            operationName: nameof(TryAcquireLockAsync),
+            key: lockKey,
+            ct);
 
     private async Task ReleaseLockAsync(string lockKey, string token)
     {
@@ -260,13 +287,15 @@ public sealed class RedisCacheService : ICacheService
             end
             """;
 
-        try
-        {
-            await Db.ScriptEvaluateAsync(script, new RedisKey[] { lockKey }, new RedisValue[] { token });
-        }
-        catch (RedisConnectionException ex)
-        {
-            _logger.LogWarning(ex, "Failed to release lock {LockKey}; it will expire naturally", lockKey);
-        }
+        await SafeExecuteAsync(
+            async token =>
+            {
+                await Db.ScriptEvaluateAsync(script, new RedisKey[] { lockKey }, new RedisValue[] { token });
+                return true;
+            },
+            fallback: false, // lock will expire naturally via its own TTL — not a correctness issue
+            operationName: nameof(ReleaseLockAsync),
+            key: lockKey,
+            CancellationToken.None);
     }
 }
